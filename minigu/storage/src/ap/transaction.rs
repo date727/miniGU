@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::{Arc, OnceLock};
 
+use minigu_common::types::{EdgeId, LabelId, VertexId};
 use minigu_transaction::{IsolationLevel, Timestamp, Transaction, global_timestamp_generator};
 
 use crate::ap::olap_graph::{OlapStorage, OlapStorageEdge};
@@ -21,6 +23,8 @@ pub struct MemTransaction {
     /// Undo buffer: a sequence of DeltaOp timestamps recorded by the transaction.
     /// For this minimal implementation we store pairs of (DeltaOp, timestamp)
     pub undo_buffer: parking_lot::RwLock<Vec<(DeltaOp, Timestamp)>>,
+    /// Snapshots for edges soft-deleted in this txn (label_id, dst_id)
+    pub deleted_edge_snapshot: parking_lot::RwLock<HashMap<EdgeId, (Option<LabelId>, VertexId)>>,
 }
 
 impl MemTransaction {
@@ -37,6 +41,7 @@ impl MemTransaction {
             isolation_level,
             commit_ts: OnceLock::new(),
             undo_buffer: parking_lot::RwLock::new(Vec::new()),
+            deleted_edge_snapshot: parking_lot::RwLock::new(HashMap::new()),
         }
     }
 
@@ -74,6 +79,22 @@ impl MemTransaction {
                             && block.edges[offset].commit_ts == self.txn_id
                         {
                             block.edges[offset].commit_ts = commit_ts;
+                            // promote property versions written in this txn to committed
+                            drop(edges);
+                            let mut prop_cols = self.storage.property_columns.write().unwrap();
+                            for column in prop_cols.iter_mut() {
+                                if let Some(pb) = column.blocks.get_mut(block_idx)
+                                    && offset < pb.values.len()
+                                    && let Some(last) = pb.values[offset].last_mut()
+                                    && last.ts == self.txn_id
+                                {
+                                    last.ts = commit_ts;
+                                    pb.min_ts = pb.min_ts.min(commit_ts);
+                                    pb.max_ts = pb.max_ts.max(commit_ts);
+                                }
+                            }
+                            // reacquire edges lock for subsequent ops
+                            edges = self.storage.edges.write().unwrap();
                         }
                     }
                 }
@@ -88,6 +109,22 @@ impl MemTransaction {
                             && block.edges[offset].commit_ts == self.txn_id
                         {
                             block.edges[offset].commit_ts = commit_ts;
+                            // promote property versions written in this txn to committed
+                            drop(edges);
+                            let mut prop_cols = self.storage.property_columns.write().unwrap();
+                            for column in prop_cols.iter_mut() {
+                                if let Some(pb) = column.blocks.get_mut(block_idx)
+                                    && offset < pb.values.len()
+                                    && let Some(last) = pb.values[offset].last_mut()
+                                    && last.ts == self.txn_id
+                                {
+                                    last.ts = commit_ts;
+                                    pb.min_ts = pb.min_ts.min(commit_ts);
+                                    pb.max_ts = pb.max_ts.max(commit_ts);
+                                }
+                            }
+                            // reacquire edges lock for subsequent ops
+                            edges = self.storage.edges.write().unwrap();
                         }
                     }
                 }
@@ -108,6 +145,9 @@ impl MemTransaction {
                 _ => {}
             }
         }
+
+        // Clear deletion snapshots after commit bookkeeping
+        self.deleted_edge_snapshot.write().clear();
 
         Ok(commit_ts)
     }
@@ -147,8 +187,8 @@ impl MemTransaction {
                 }
                 DeltaOp::DelEdge(eid) => {
                     // Undo a deletion -> restore the old edge commit_ts
-                    // Edge data and properties are still in storage, only commit_ts was marked
-                    // old_commit_ts is obtained from undo entry's timestamp
+                    // Edge data and properties are still in storage. Restore commit_ts and
+                    // label/dst from snapshot (if present). old_commit_ts is from undo entry.
                     if let Some(loc) = self.storage.edge_id_map.get(&eid) {
                         let (block_idx, offset) = *loc.value();
                         let mut edges = self.storage.edges.write().unwrap();
@@ -158,6 +198,12 @@ impl MemTransaction {
                         {
                             // Restore edge commit_ts (properties are still in storage)
                             block.edges[offset].commit_ts = old_ts;
+                            if let Some((label_id, dst_id)) =
+                                self.deleted_edge_snapshot.read().get(&eid).cloned()
+                            {
+                                block.edges[offset].label_id = label_id;
+                                block.edges[offset].dst_id = dst_id;
+                            }
                         }
                     }
                 }
@@ -183,7 +229,7 @@ impl MemTransaction {
                                         block_idx,
                                         crate::ap::olap_graph::PropertyBlock {
                                             values: vec![
-                                                None;
+                                                Vec::new();
                                                 crate::ap::olap_graph::BLOCK_CAPACITY
                                             ],
                                             min_ts: old_ts,
@@ -192,8 +238,18 @@ impl MemTransaction {
                                     );
                                 }
                                 let pb = &mut column.blocks[block_idx];
+                                pb.min_ts = pb.min_ts.min(old_ts);
+                                pb.max_ts = pb.max_ts.max(old_ts);
+                                if let Some(last) = pb.values[offset].last()
+                                    && last.ts == self.txn_id
+                                {
+                                    pb.values[offset].pop();
+                                }
                                 let old_val = props_op.props[k].clone();
-                                pb.values[offset] = Some(old_val);
+                                pb.values[offset].push(crate::ap::olap_graph::PropertyVersion {
+                                    ts: old_ts,
+                                    value: Some(old_val),
+                                });
                             }
                             // Restore commit_ts
                             block.edges[offset].commit_ts = old_ts;
@@ -206,6 +262,7 @@ impl MemTransaction {
 
         // clear undo buffer after abort
         buffer.clear();
+        self.deleted_edge_snapshot.write().clear();
 
         Ok(())
     }
@@ -215,6 +272,13 @@ impl MemTransaction {
 impl MemTransaction {
     pub fn push_undo(&self, op: DeltaOp, ts: Timestamp) {
         self.undo_buffer.write().push((op, ts));
+    }
+
+    /// Record snapshot of an edge before soft deletion so abort can restore it.
+    pub fn record_deleted_edge(&self, eid: EdgeId, label_id: Option<LabelId>, dst_id: VertexId) {
+        self.deleted_edge_snapshot
+            .write()
+            .insert(eid, (label_id, dst_id));
     }
 }
 

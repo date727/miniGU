@@ -72,9 +72,11 @@ impl Iterator for EdgeIter<'_> {
                                 .blocks
                                 .get(self.block_idx)
                                 .and_then(|blk| blk.values.get(self.offset))
-                                .cloned()
+                                .and_then(|versions| {
+                                    crate::ap::olap_graph::latest_committed_prop_value(versions)
+                                })
                             {
-                                props.set_prop(col_idx, val);
+                                props.set_prop(col_idx, Some(val));
                             }
                         }
                         props
@@ -179,9 +181,15 @@ impl Iterator for EdgeIterAtTs<'_> {
                                 .blocks
                                 .get(self.block_idx)
                                 .and_then(|blk| blk.values.get(self.offset))
-                                .cloned()
+                                .and_then(|versions| {
+                                    crate::ap::olap_graph::prop_value_visible_at(
+                                        versions,
+                                        self.txn_id,
+                                        &self.commit_ts,
+                                    )
+                                })
                             {
-                                props.set_prop(col_idx, val);
+                                props.set_prop(col_idx, Some(val));
                             }
                         }
                         props

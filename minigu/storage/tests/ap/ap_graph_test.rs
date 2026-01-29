@@ -604,14 +604,14 @@ fn delete_property_test() {
 
         let binding = storage.property_columns.read().unwrap();
         let property_block = binding.first().unwrap().blocks.first().unwrap();
-        assert_eq!(
-            property_block.values[0],
-            Some(ScalarValue::UInt32(Some(10)))
-        );
-        assert_eq!(
-            property_block.values[1],
-            Some(ScalarValue::UInt32(Some(30)))
-        );
+        let v0 = property_block.values[0]
+            .last()
+            .and_then(|pv| pv.value.clone());
+        let v1 = property_block.values[1]
+            .last()
+            .and_then(|pv| pv.value.clone());
+        assert_eq!(v0, Some(ScalarValue::UInt32(Some(10))));
+        assert_eq!(v1, Some(ScalarValue::UInt32(Some(30))));
     }
 
     let _ = storage.delete_edge(&txn, *label_to_eid.get(&1u64).unwrap());
@@ -989,14 +989,13 @@ fn dataset1_col_storage_analysis() {
 
     let start_col_analysis1 = Instant::now();
     for block in &x.get(2).unwrap().blocks {
-        for option in &block.values {
-            if option.is_none() {
+        for versions in &block.values {
+            if versions.is_empty() {
                 break;
             }
-            _total1 += <Option<ScalarValue> as Clone>::clone(option)
-                .unwrap()
-                .get_float64()
-                .unwrap();
+            if let Some(s) = versions.last().and_then(|pv| pv.value.clone()) {
+                _total1 += s.get_float64().unwrap();
+            }
         }
     }
 
@@ -1023,16 +1022,12 @@ fn dataset1_col_storage_analysis() {
 
     let start_col_analysis2 = Instant::now();
     for block in &x.get(3).unwrap().blocks {
-        for option in &block.values {
-            if option.is_none() {
+        for versions in &block.values {
+            if versions.is_empty() {
                 break;
             }
-            max1 = max1.max(
-                option
-                    .clone()
-                    .map(|s| s.get_float64().unwrap())
-                    .unwrap_or_default(),
-            );
+            let latest = versions.last().and_then(|pv| pv.value.clone());
+            max1 = max1.max(latest.map(|s| s.get_float64().unwrap()).unwrap_or_default());
         }
     }
 
@@ -1061,16 +1056,12 @@ fn dataset1_col_storage_analysis() {
 
     let start_col_analysis3 = Instant::now();
     for block in &x.get(4).unwrap().blocks {
-        for option in &block.values {
-            if option.is_none() {
+        for versions in &block.values {
+            if versions.is_empty() {
                 break;
             }
-            min1 = min1.min(
-                option
-                    .clone()
-                    .map(|s| s.get_float64().unwrap())
-                    .unwrap_or_default(),
-            );
+            let latest = versions.last().and_then(|pv| pv.value.clone());
+            min1 = min1.min(latest.map(|s| s.get_float64().unwrap()).unwrap_or_default());
         }
     }
 
@@ -1322,20 +1313,20 @@ fn measure_memory_column(vec: &RwLock<Vec<PropertyColumn>>) -> usize {
         let mut single_size = 0;
         for block in &column.blocks {
             total_size += size_of_val(&block.values);
-            for value in &block.values {
-                if value.is_none() {
+            for versions in &block.values {
+                if versions.is_empty() {
                     total_size += single_size;
                 } else {
-                    let clone = value.clone();
-                    let size = match clone.unwrap() {
-                        ScalarValue::Int32(_) => size_of::<i32>(),
-                        ScalarValue::Int64(_) => size_of::<i64>(),
-                        ScalarValue::Float32(_) => size_of::<f32>(),
-                        ScalarValue::Float64(_) => size_of::<f64>(),
-                        ScalarValue::String(Some(s)) => {
+                    let latest = versions.last().and_then(|pv| pv.value.clone());
+                    let size = match latest {
+                        Some(ScalarValue::Int32(_)) => size_of::<i32>(),
+                        Some(ScalarValue::Int64(_)) => size_of::<i64>(),
+                        Some(ScalarValue::Float32(_)) => size_of::<f32>(),
+                        Some(ScalarValue::Float64(_)) => size_of::<f64>(),
+                        Some(ScalarValue::String(Some(ref s))) => {
                             size_of::<String>() + s.len() * size_of::<u8>()
                         }
-                        ScalarValue::Boolean(_) => size_of::<bool>(),
+                        Some(ScalarValue::Boolean(_)) => size_of::<bool>(),
                         _ => 0,
                     };
                     total_size += size;
