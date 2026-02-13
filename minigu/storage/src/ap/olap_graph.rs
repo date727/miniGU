@@ -115,25 +115,16 @@ pub(crate) fn latest_prop_value(versions: &[PropertyVersion]) -> Option<ScalarVa
 pub(crate) fn prop_value_visible_at(
     versions: &[PropertyVersion],
     txn_id: Option<Timestamp>,
-    commit_ts: &std::sync::OnceLock<Timestamp>,
+    start_ts: Timestamp,
 ) -> Option<ScalarValue> {
     for v in versions.iter().rev() {
-        if let Some(target) = commit_ts.get() {
-            if v.ts.is_txn_id() {
-                if Some(v.ts) == txn_id {
-                    return v.value.clone();
-                }
-                continue;
-            }
-            if v.ts.raw() <= target.raw() {
-                return v.value.clone();
-            }
-        } else if v.ts.is_txn_id() {
+        if v.ts.is_txn_id() {
             if Some(v.ts) == txn_id {
                 return v.value.clone();
             }
-        } else {
-            // Uncommitted reader without commit_ts sees latest committed version
+            continue;
+        }
+        if v.ts.raw() <= start_ts.raw() {
             return v.value.clone();
         }
     }
@@ -500,6 +491,14 @@ impl OlapStorage {
         }
         block.edge_counter += 1;
 
+        // Update mapping for moved edges (shifted right by one)
+        for i in (insert_pos + 1)..block.edge_counter {
+            let moved_eid = block.edges[i].eid;
+            if moved_eid != 0 {
+                self.edge_id_map.insert(moved_eid, (vertex.block_offset, i));
+            }
+        }
+
         // set commit_ts to txn id and store eid
         block.edges[insert_pos] = OlapStorageEdge {
             eid,
@@ -690,32 +689,36 @@ impl OlapStorage {
             })?
             .value();
 
-        let edges_lock = self.edges.read().unwrap();
-        let block = edges_lock.get(block_idx).ok_or_else(|| {
-            StorageError::EdgeNotFound(EdgeNotFound(format!("Edge block {} not found", block_idx)))
-        })?;
+        let mut edges_lock = self.edges.write().unwrap();
+        let (old_commit_ts, old_label_id, old_dst_id) = {
+            let block = edges_lock.get(block_idx).ok_or_else(|| {
+                StorageError::EdgeNotFound(EdgeNotFound(format!(
+                    "Edge block {} not found",
+                    block_idx
+                )))
+            })?;
 
-        if block.is_tombstone || offset >= block.edge_counter {
-            return Err(StorageError::EdgeNotFound(EdgeNotFound(format!(
-                "Edge {} not found",
-                eid
-            ))));
-        }
+            if block.is_tombstone || offset >= block.edge_counter {
+                return Err(StorageError::EdgeNotFound(EdgeNotFound(format!(
+                    "Edge {} not found",
+                    eid
+                ))));
+            }
 
-        let edge_data = &block.edges[offset];
-        if edge_data.eid != eid {
-            return Err(StorageError::EdgeNotFound(EdgeNotFound(format!(
-                "Edge {} not found",
-                eid
-            ))));
-        }
+            let edge_data = &block.edges[offset];
+            if edge_data.eid != eid {
+                return Err(StorageError::EdgeNotFound(EdgeNotFound(format!(
+                    "Edge {} not found",
+                    eid
+                ))));
+            }
+
+            (edge_data.commit_ts, edge_data.label_id, edge_data.dst_id)
+        };
 
         // Save old_commit_ts as timestamp in undo entry
-        let old_commit_ts = edge_data.commit_ts;
         // Record original identifiers for rollback
-        txn.record_deleted_edge(eid, edge_data.label_id, edge_data.dst_id);
-        drop(edges_lock);
-
+        txn.record_deleted_edge(eid, old_label_id, old_dst_id);
         let mut props_vec: Vec<minigu_common::value::ScalarValue> = Vec::new();
         {
             let property_columns = self.property_columns.read().unwrap();
@@ -734,8 +737,7 @@ impl OlapStorage {
         txn.push_undo(crate::common::DeltaOp::DelEdge(eid), old_commit_ts);
 
         // Mark edge as deleted: set tombstone values and stamp txn_id
-        let mut edge_blocks = self.edges.write().unwrap();
-        let edge_block = &mut edge_blocks[block_idx];
+        let edge_block = &mut edges_lock[block_idx];
         edge_block.edges[offset].label_id = NonZeroU32::new(TOMBSTONE_LABEL_ID);
         edge_block.edges[offset].dst_id = TOMBSTONE_DST_ID;
         edge_block.edges[offset].commit_ts = txn.txn_id;
@@ -836,7 +838,7 @@ impl OlapGraph for OlapStorage {
                         .get(block_idx)
                         .and_then(|blk| blk.values.get(offset))
                         .and_then(|versions| {
-                            prop_value_visible_at(versions, Some(txn.txn_id), &txn.commit_ts)
+                            prop_value_visible_at(versions, Some(txn.txn_id), txn.start_ts)
                         })
                     {
                         props.set_prop(col_idx, Some(val));
@@ -869,7 +871,7 @@ impl OlapGraph for OlapStorage {
             return Ok(None);
         }
 
-        if txn.txn_id.raw() < block.min_ts.raw() {
+        if block.min_ts.is_commit_ts() && txn.start_ts.raw() < block.min_ts.raw() {
             return Ok(None);
         }
 
@@ -882,14 +884,10 @@ impl OlapGraph for OlapStorage {
             return Ok(None);
         }
 
-        let is_visible = if let Some(commit_ts) = txn.commit_ts.get() {
-            if edge.commit_ts.is_txn_id() {
-                edge.commit_ts.raw() == txn.txn_id.raw()
-            } else {
-                edge.commit_ts.raw() <= commit_ts.raw()
-            }
+        let is_visible = if edge.commit_ts.is_txn_id() {
+            edge.commit_ts.raw() == txn.txn_id.raw()
         } else {
-            edge.commit_ts.is_txn_id() && (edge.commit_ts.raw() == txn.txn_id.raw())
+            edge.commit_ts.raw() <= txn.start_ts.raw()
         };
 
         if !is_visible {
@@ -909,7 +907,9 @@ impl OlapGraph for OlapStorage {
                         .blocks
                         .get(block_idx)
                         .and_then(|blk| blk.values.get(offset))
-                        .and_then(|versions| latest_committed_prop_value(versions))
+                        .and_then(|versions| {
+                            prop_value_visible_at(versions, Some(txn.txn_id), txn.start_ts)
+                        })
                     {
                         props.set_prop(col_idx, Some(val));
                     }
@@ -947,7 +947,7 @@ impl OlapGraph for OlapStorage {
             block_idx: 0,
             offset: 0,
             txn_id: Some(txn.txn_id),
-            commit_ts: txn.commit_ts.clone(),
+            start_ts: txn.start_ts,
         })
     }
 
@@ -978,7 +978,7 @@ impl OlapGraph for OlapStorage {
             block_idx: vertex.block_offset,
             offset: 0,
             txn_id: Some(txn.txn_id),
-            commit_ts: txn.commit_ts.clone(),
+            start_ts: txn.start_ts,
         })
     }
 }
@@ -1109,6 +1109,14 @@ impl MutOlapGraph for OlapStorage {
         }
         block.edge_counter += 1;
 
+        // Update mapping for moved edges (shifted right by one)
+        for i in (insert_pos + 1)..block.edge_counter {
+            let moved_eid = block.edges[i].eid;
+            if moved_eid != 0 {
+                self.edge_id_map.insert(moved_eid, (vertex.block_offset, i));
+            }
+        }
+
         // 5.3 Actual insert with eid
         block.edges[insert_pos] = OlapStorageEdge {
             eid,
@@ -1121,7 +1129,7 @@ impl MutOlapGraph for OlapStorage {
         self.edge_id_map
             .insert(eid, (vertex.block_offset, insert_pos));
 
-        // 5. Insert properties
+        // 6. Insert properties
         for (i, column) in self
             .property_columns
             .write()
@@ -1129,7 +1137,7 @@ impl MutOlapGraph for OlapStorage {
             .iter_mut()
             .enumerate()
         {
-            // 5.1 Get property block or allocate one
+            // 6.1 Get property block or allocate one
             let property_block = if let Some(block) = column.blocks.get_mut(vertex.block_offset) {
                 block
             } else {
@@ -1137,19 +1145,19 @@ impl MutOlapGraph for OlapStorage {
                     vertex.block_offset,
                     PropertyBlock {
                         values: vec![Vec::new(); BLOCK_CAPACITY],
-                        min_ts: Timestamp::with_ts(0),
-                        max_ts: Timestamp::max_commit_ts(),
+                        min_ts: Timestamp::max_commit_ts(),
+                        max_ts: Timestamp::with_ts(0),
                     },
                 );
                 column.blocks.get_mut(vertex.block_offset).unwrap()
             };
 
-            // 5.2 Move property elements
+            // 6.2 Move property elements
             for j in (insert_pos..block.edge_counter - 1).rev() {
                 property_block.values[j + 1] = property_block.values[j].clone();
             }
 
-            // 5.3 Insert property
+            // 6.3 Insert property
             if let Some(property_value) = edge.properties.get(i) {
                 property_block.values[insert_pos].push(PropertyVersion {
                     ts: Timestamp::with_ts(0),
@@ -1163,7 +1171,7 @@ impl MutOlapGraph for OlapStorage {
             }
         }
 
-        // 6.Update block header
+        // 7. Update block header
         block.min_dst_id = edge.dst_id.min(block.min_dst_id);
         block.max_dst_id = edge.dst_id.max(block.max_dst_id);
         block.max_label_id = edge.label_id.max(block.max_label_id);

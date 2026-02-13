@@ -1,5 +1,4 @@
 use std::num::NonZeroU32;
-use std::sync::OnceLock;
 
 use minigu_transaction::Timestamp;
 
@@ -98,7 +97,7 @@ pub struct EdgeIterAtTs<'a> {
     // Offset within block
     pub offset: usize,
     pub txn_id: Option<Timestamp>,
-    pub commit_ts: OnceLock<Timestamp>,
+    pub start_ts: Timestamp,
 }
 impl Iterator for EdgeIterAtTs<'_> {
     type Item = Result<OlapEdge, StorageError>;
@@ -123,9 +122,7 @@ impl Iterator for EdgeIterAtTs<'_> {
                 continue;
             }
             // Block-level timestamp filter
-            if let Some(ts) = self.txn_id
-                && ts.raw() < block.min_ts.raw()
-            {
+            if block.min_ts.is_commit_ts() && self.start_ts.raw() < block.min_ts.raw() {
                 self.block_idx += 1;
                 self.offset = 0;
                 continue;
@@ -146,14 +143,10 @@ impl Iterator for EdgeIterAtTs<'_> {
                     continue;
                 }
                 // 2.2 Visibility filtering by edge commit_ts
-                let is_visible = if self.commit_ts.get().is_some() {
-                    if raw.commit_ts.is_txn_id() {
-                        self.txn_id == Some(raw.commit_ts)
-                    } else {
-                        raw.commit_ts.raw() <= self.commit_ts.get().unwrap().raw()
-                    }
+                let is_visible = if raw.commit_ts.is_txn_id() {
+                    self.txn_id == Some(raw.commit_ts)
                 } else {
-                    raw.commit_ts.is_txn_id() && (self.txn_id == Some(raw.commit_ts))
+                    raw.commit_ts.raw() <= self.start_ts.raw()
                 };
 
                 if !is_visible {
@@ -185,7 +178,7 @@ impl Iterator for EdgeIterAtTs<'_> {
                                     crate::ap::olap_graph::prop_value_visible_at(
                                         versions,
                                         self.txn_id,
-                                        &self.commit_ts,
+                                        self.start_ts,
                                     )
                                 })
                             {

@@ -1,5 +1,4 @@
 use std::num::NonZeroU32;
-use std::sync::OnceLock;
 
 use minigu_common::types::VertexId;
 use minigu_transaction::Timestamp;
@@ -107,7 +106,7 @@ pub struct AdjacencyIteratorAtTs<'a> {
     // Offset within block
     pub offset: usize,
     pub txn_id: Option<Timestamp>,
-    pub commit_ts: OnceLock<Timestamp>,
+    pub start_ts: Timestamp,
 }
 impl Iterator for AdjacencyIteratorAtTs<'_> {
     type Item = Result<OlapEdge, StorageError>;
@@ -133,9 +132,7 @@ impl Iterator for AdjacencyIteratorAtTs<'_> {
                 continue;
             }
 
-            if let Some(ts) = self.txn_id
-                && ts.raw() < block.min_ts.raw()
-            {
+            if block.min_ts.is_commit_ts() && self.start_ts.raw() < block.min_ts.raw() {
                 self.block_idx = block.pre_block_index.unwrap_or(usize::MAX);
                 self.offset = 0;
                 continue;
@@ -157,22 +154,20 @@ impl Iterator for AdjacencyIteratorAtTs<'_> {
                     continue;
                 }
 
-                // Visibility filtering by edge commit_ts when target_ts is provided
-                if let Some(target) = self.commit_ts.get() {
-                    if raw.commit_ts.is_txn_id() {
-                        if let Some(txn_id) = self.txn_id {
-                            if raw.commit_ts != txn_id {
-                                self.offset += 1;
-                                continue;
-                            }
-                        } else {
+                // Visibility filtering by edge commit_ts using snapshot start_ts
+                if raw.commit_ts.is_txn_id() {
+                    if let Some(txn_id) = self.txn_id {
+                        if raw.commit_ts != txn_id {
                             self.offset += 1;
                             continue;
                         }
-                    } else if raw.commit_ts.raw() > target.raw() {
+                    } else {
                         self.offset += 1;
                         continue;
                     }
+                } else if raw.commit_ts.raw() > self.start_ts.raw() {
+                    self.offset += 1;
+                    continue;
                 }
 
                 // Build edge result
@@ -198,7 +193,7 @@ impl Iterator for AdjacencyIteratorAtTs<'_> {
                                     crate::ap::olap_graph::prop_value_visible_at(
                                         versions,
                                         self.txn_id,
-                                        &self.commit_ts,
+                                        self.start_ts,
                                     )
                                 })
                             {

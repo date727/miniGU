@@ -66,21 +66,30 @@ impl MemTransaction {
 
         // Walk undo buffer and for create/set/del edge ops, replace commit_ts markers
         let undo_entries = self.undo_buffer.read().clone();
+        let mut edges = self.storage.edges.write().unwrap();
         for (op, _ts) in undo_entries.into_iter() {
             match op {
                 DeltaOp::CreateEdge(edge) => {
                     // Use EdgeId mapping to find and update commit_ts
                     if let Some(loc) = self.storage.edge_id_map.get(&edge.eid()) {
                         let (block_idx, offset) = *loc.value();
-                        let mut edges = self.storage.edges.write().unwrap();
                         if let Some(block) = edges.get_mut(block_idx)
                             && offset < block.edge_counter
                             && block.edges[offset].eid == edge.eid()
                             && block.edges[offset].commit_ts == self.txn_id
                         {
                             block.edges[offset].commit_ts = commit_ts;
+                            block.min_ts = if block.min_ts.is_txn_id() {
+                                commit_ts
+                            } else {
+                                block.min_ts.min(commit_ts)
+                            };
+                            block.max_ts = if block.max_ts.is_txn_id() {
+                                commit_ts
+                            } else {
+                                block.max_ts.max(commit_ts)
+                            };
                             // promote property versions written in this txn to committed
-                            drop(edges);
                             let mut prop_cols = self.storage.property_columns.write().unwrap();
                             for column in prop_cols.iter_mut() {
                                 if let Some(pb) = column.blocks.get_mut(block_idx)
@@ -93,8 +102,6 @@ impl MemTransaction {
                                     pb.max_ts = pb.max_ts.max(commit_ts);
                                 }
                             }
-                            // reacquire edges lock for subsequent ops
-                            edges = self.storage.edges.write().unwrap();
                         }
                     }
                 }
@@ -102,15 +109,23 @@ impl MemTransaction {
                     // Use EdgeId mapping to find and update commit_ts
                     if let Some(loc) = self.storage.edge_id_map.get(&eid) {
                         let (block_idx, offset) = *loc.value();
-                        let mut edges = self.storage.edges.write().unwrap();
                         if let Some(block) = edges.get_mut(block_idx)
                             && offset < block.edge_counter
                             && block.edges[offset].eid == eid
                             && block.edges[offset].commit_ts == self.txn_id
                         {
                             block.edges[offset].commit_ts = commit_ts;
+                            block.min_ts = if block.min_ts.is_txn_id() {
+                                commit_ts
+                            } else {
+                                block.min_ts.min(commit_ts)
+                            };
+                            block.max_ts = if block.max_ts.is_txn_id() {
+                                commit_ts
+                            } else {
+                                block.max_ts.max(commit_ts)
+                            };
                             // promote property versions written in this txn to committed
-                            drop(edges);
                             let mut prop_cols = self.storage.property_columns.write().unwrap();
                             for column in prop_cols.iter_mut() {
                                 if let Some(pb) = column.blocks.get_mut(block_idx)
@@ -123,8 +138,6 @@ impl MemTransaction {
                                     pb.max_ts = pb.max_ts.max(commit_ts);
                                 }
                             }
-                            // reacquire edges lock for subsequent ops
-                            edges = self.storage.edges.write().unwrap();
                         }
                     }
                 }
@@ -132,13 +145,22 @@ impl MemTransaction {
                     // Use EdgeId mapping to find and update commit_ts
                     if let Some(loc) = self.storage.edge_id_map.get(&eid) {
                         let (block_idx, offset) = *loc.value();
-                        let mut edges = self.storage.edges.write().unwrap();
                         if let Some(block) = edges.get_mut(block_idx)
                             && offset < block.edge_counter
                             && block.edges[offset].eid == eid
                             && block.edges[offset].commit_ts == self.txn_id
                         {
                             block.edges[offset].commit_ts = commit_ts;
+                            block.min_ts = if block.min_ts.is_txn_id() {
+                                commit_ts
+                            } else {
+                                block.min_ts.min(commit_ts)
+                            };
+                            block.max_ts = if block.max_ts.is_txn_id() {
+                                commit_ts
+                            } else {
+                                block.max_ts.max(commit_ts)
+                            };
                         }
                     }
                 }
@@ -156,6 +178,7 @@ impl MemTransaction {
         // Apply undo entries in reverse order
         let mut buffer = self.undo_buffer.write();
         let entries = buffer.clone();
+        let mut edges = self.storage.edges.write().unwrap();
         for (op, old_ts) in entries.into_iter().rev() {
             match op {
                 DeltaOp::CreateEdge(edge) => {
@@ -163,7 +186,7 @@ impl MemTransaction {
                     let eid = edge.eid();
                     if let Some(loc) = self.storage.edge_id_map.get(&eid) {
                         let (block_idx, offset) = *loc.value();
-                        let mut edges = self.storage.edges.write().unwrap();
+                        drop(loc);
                         if let Some(block) = edges.get_mut(block_idx)
                             && offset < block.edge_counter
                             && block.edges[offset].eid == eid
@@ -174,12 +197,33 @@ impl MemTransaction {
                                 block.edges[j] = block.edges[j + 1];
                             }
                             block.edge_counter -= 1;
+                            for i in offset..block.edge_counter {
+                                let moved_eid = block.edges[i].eid;
+                                if moved_eid != 0 {
+                                    self.storage.edge_id_map.insert(moved_eid, (block_idx, i));
+                                }
+                            }
                             block.edges[block.edge_counter] = OlapStorageEdge {
                                 eid: 0,
                                 label_id: NonZeroU32::new(1),
                                 dst_id: 1,
                                 commit_ts: Timestamp::with_ts(0),
                             };
+                            let mut property_cols = self.storage.property_columns.write().unwrap();
+                            for property_col in property_cols.iter_mut() {
+                                if let Some(property_block) = property_col.blocks.get_mut(block_idx)
+                                {
+                                    let values = &mut property_block.values;
+                                    for i in offset..block.edge_counter {
+                                        if i + 1 < values.len() {
+                                            values[i] = values[i + 1].clone();
+                                        }
+                                    }
+                                    if block.edge_counter < values.len() {
+                                        values[block.edge_counter] = Vec::new();
+                                    }
+                                }
+                            }
                             // Remove from mapping
                             self.storage.edge_id_map.remove(&eid);
                         }
@@ -191,7 +235,6 @@ impl MemTransaction {
                     // label/dst from snapshot (if present). old_commit_ts is from undo entry.
                     if let Some(loc) = self.storage.edge_id_map.get(&eid) {
                         let (block_idx, offset) = *loc.value();
-                        let mut edges = self.storage.edges.write().unwrap();
                         if let Some(block) = edges.get_mut(block_idx)
                             && offset < block.edge_counter
                             && block.edges[offset].eid == eid
@@ -212,7 +255,6 @@ impl MemTransaction {
                     // old_commit_ts is obtained from undo entry's timestamp
                     if let Some(loc) = self.storage.edge_id_map.get(&eid) {
                         let (block_idx, offset) = *loc.value();
-                        let mut edges = self.storage.edges.write().unwrap();
                         if let Some(block) = edges.get_mut(block_idx)
                             && offset < block.edge_counter
                             && block.edges[offset].eid == eid

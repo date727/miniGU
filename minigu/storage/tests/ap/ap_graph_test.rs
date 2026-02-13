@@ -27,7 +27,7 @@ const PATH: &str = "";
 pub fn mock_olap_graph(property_cnt: u64) -> OlapStorage {
     let storage = OlapStorage {
         logic_id_counter: AtomicU64::new(0),
-        edge_id_counter: AtomicU64::new(0),
+        edge_id_counter: AtomicU64::new(1),
         dense_id_map: DashMap::new(),
         edge_id_map: DashMap::new(),
         vertices: RwLock::new(Vec::new()),
@@ -51,8 +51,13 @@ pub fn mock_olap_graph(property_cnt: u64) -> OlapStorage {
 // Helper function to create a mock transaction for testing
 fn mock_transaction(storage: Arc<OlapStorage>) -> MemTransaction {
     let arc_storage = storage;
-    let txn_id = Timestamp::with_ts(1);
-    MemTransaction::new(arc_storage, txn_id, txn_id, IsolationLevel::Snapshot)
+    let txn_id = Timestamp::with_ts(Timestamp::TXN_ID_START + 1);
+    MemTransaction::new(
+        arc_storage,
+        txn_id,
+        Timestamp::with_ts(1),
+        IsolationLevel::Snapshot,
+    )
 }
 
 #[test]
